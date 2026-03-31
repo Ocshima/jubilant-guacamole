@@ -76,6 +76,14 @@ Resources:
                   # SAM managed stack for artifact bucket
                   - !Sub 'arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/aws-sam-cli-managed-default*'
 
+              # SAM transform — CreateChangeSet must be allowed on the AWS-owned transform resource
+              - Sid: CloudFormationSAMTransform
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateChangeSet
+                Resource:
+                  - arn:aws:cloudformation:us-east-1:aws:transform/Serverless-2016-10-31
+
               # Service-level CloudFormation APIs that do not operate on a specific stack resource
               - Sid: CloudFormationGlobal
                 Effect: Allow
