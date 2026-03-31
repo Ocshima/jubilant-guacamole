@@ -1,0 +1,12 @@
+[run]
+source = src/processor
+
+[report]
+exclude_lines =
+    pragma: no cover
+    if __name__ == .__main__.:
+
+omit =
+    # Requires live AWS (S3, DynamoDB, SQS) — covered by integration tests
+    src/processor/handler.py
+    src/processor/utils/logger.py

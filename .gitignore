@@ -45,6 +45,7 @@ local-env.json
 .idea/
 *.swp
 *.swo
+.claude/
 
 # ========================
 # OS Generated

@@ -45,10 +45,9 @@ class TestValidRecord:
 
     def test_symbol_normalised_to_uppercase(self, valid_row):
         valid_row["symbol"] = "aapl"
-        # Lowercase symbol fails symbol regex — validator normalises after validation
-        # So this should fail validation (regex requires uppercase)
         result = validate_record(valid_row)
-        assert result.valid is False
+        assert result.valid is True
+        assert result.normalised["symbol"] == "AAPL"
 
     def test_side_normalised_to_uppercase(self, valid_row):
         valid_row["side"] = "buy"
@@ -138,10 +137,11 @@ class TestTimestamp:
 # ── Symbol validation ─────────────────────────────────────────────────────────
 
 class TestSymbol:
-    def test_invalid_lowercase(self, valid_row):
+    def test_lowercase_normalised(self, valid_row):
         valid_row["symbol"] = "aapl"
         result = validate_record(valid_row)
-        assert result.valid is False
+        assert result.valid is True
+        assert result.normalised["symbol"] == "AAPL"
 
     def test_invalid_too_long(self, valid_row):
         valid_row["symbol"] = "TOOLNG"
@@ -242,11 +242,17 @@ class TestPrice:
 # ── Venue validation ──────────────────────────────────────────────────────────
 
 class TestVenue:
-    @pytest.mark.parametrize("venue", ["UNKNOWN", "NASDA", "lse", ""])
+    @pytest.mark.parametrize("venue", ["UNKNOWN", "NASDA", ""])
     def test_invalid_venue(self, valid_row, venue):
         valid_row["venue"] = venue
         result = validate_record(valid_row)
         assert result.valid is False
+
+    def test_lowercase_venue_normalised(self, valid_row):
+        valid_row["venue"] = "lse"
+        result = validate_record(valid_row)
+        assert result.valid is True
+        assert result.normalised["venue"] == "LSE"
 
     @pytest.mark.parametrize("venue", ["LSE", "NYSE", "NASDAQ", "BATS", "CHI-X", "DARK"])
     def test_valid_venues(self, valid_row, venue):

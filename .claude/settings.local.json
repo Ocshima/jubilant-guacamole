@@ -3,7 +3,14 @@
     "allow": [
       "Bash(aws sqs:*)",
       "Bash(python3 -c \":*)",
-      "Bash(aws s3:*)"
+      "Bash(aws s3:*)",
+      "Bash(python -m pytest ../../tests/ -v --cov=. --cov-report=term-missing --cov-fail-under=80)",
+      "Bash(python3 -m pytest ../../tests/ -v --cov=. --cov-report=term-missing --cov-fail-under=80)",
+      "Bash(python3.12 -m pytest ../../tests/ --cov=. --cov-report=term-missing --cov-fail-under=80)",
+      "Bash(pytest --version)",
+      "Bash(pip3 install:*)",
+      "Bash(pytest ../../tests/ --cov=. --cov-report=term-missing --cov-fail-under=80)",
+      "Bash(pytest tests/ -v --cov=src/processor --cov-report=term-missing --cov-fail-under=80)"
     ]
   }
 }
