@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bootstrap stack - creates a GitHub Actions IAM role for Project 2.
+  Reuses the OIDC provider already created by Project 1's bootstrap stack.
+  Deploy this ONCE before the main stack. Each project gets its own role
+  and its own AWS_ROLE_ARN secret — they never need to change.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: Your GitHub username or organisation (e.g. omar-a)
+
+  GitHubRepo:
+    Type: String
+    Description: Repository name for this project (e.g. aws-trade-etl-pipeline)
+
+  OIDCProviderArn:
+    Type: String
+    Description: >
+      ARN of the existing GitHub OIDC provider created by Project 1's bootstrap.
+      Find it in the Project 1 stack outputs, or:
+      aws iam list-open-id-connect-providers
+
+  MainStackName:
+    Type: String
+    Default: trade-etl-pipeline
+    Description: Name you will give the main stack (must match deploy workflow)
+
+Resources:
+
+  # ── GitHub Actions Deployment Role ─────────────────────────────
+  # Trusts the shared OIDC provider created by Project 1.
+  # Project 1 and Project 2 each have their own role — no shared credentials.
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'GitHubActions-${GitHubRepo}-DeployRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Ref OIDCProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                # Allows any workflow trigger from this repo (push, environment, workflow_dispatch)
+                token.actions.githubusercontent.com:sub: !Sub 'repo:${GitHubOrg}/${GitHubRepo}:*'
+      Policies:
+        - PolicyName: DeployPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # CloudFormation - deploy and manage the main stack
+              # SAM expand also needs access to the serverless transform stack
+              - Sid: CloudFormation
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:ListStackResources
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:ListChangeSets
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/${MainStackName}*'
+                  # SAM managed stack for artifact bucket
+                  - !Sub 'arn:aws:cloudformation:us-east-1:${AWS::AccountId}:stack/aws-sam-cli-managed-default*'
+
+              # Service-level CloudFormation APIs that do not operate on a specific stack resource
+              - Sid: CloudFormationGlobal
+                Effect: Allow
+                Action:
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:GetTemplateSummary
+                Resource: '*'
+
+              # S3 - raw uploads bucket management (CloudFormation creates/configures it)
+              - Sid: S3BucketManagement
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutBucketVersioning
+                  - s3:GetBucketVersioning
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutBucketPublicAccessBlock
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucketPolicy
+                  - s3:GetBucketPolicy
+                  - s3:PutLifecycleConfiguration
+                  - s3:GetLifecycleConfiguration
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-*'
+
+              # S3 - SAM deployment artifact bucket (created by sam deploy --resolve-s3)
+              - Sid: S3SAMArtifacts
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:GetEncryptionConfiguration
+                  - s3:PutEncryptionConfiguration
+                  - s3:GetBucketVersioning
+                  - s3:GetBucketPolicy
+                  - s3:PutBucketPolicy
+                  - s3:GetBucketPublicAccessBlock
+                  - s3:PutBucketPublicAccessBlock
+                Resource:
+                  - arn:aws:s3:::aws-sam-cli-managed-default*
+                  - arn:aws:s3:::aws-sam-cli-managed-default*/*
+
+              # Lambda - create, update, and delete the processor function
+              - Sid: Lambda
+                Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:GetPolicy
+                  - lambda:PutFunctionConcurrency
+                  - lambda:DeleteFunctionConcurrency
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:ListTags
+                Resource: !Sub 'arn:aws:lambda:us-east-1:${AWS::AccountId}:function:${MainStackName}*'
+
+              # DynamoDB - create and manage trades and idempotency tables
+              - Sid: DynamoDB
+                Effect: Allow
+                Action:
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                Resource: !Sub 'arn:aws:dynamodb:us-east-1:${AWS::AccountId}:table/${MainStackName}*'
+
+              # SQS - create and manage the dead-letter queue
+              - Sid: SQS
+                Effect: Allow
+                Action:
+                  - sqs:CreateQueue
+                  - sqs:DeleteQueue
+                  - sqs:GetQueueAttributes
+                  - sqs:SetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                  - sqs:ListQueueTags
+                Resource: !Sub 'arn:aws:sqs:us-east-1:${AWS::AccountId}:${MainStackName}*'
+
+              # SNS - create and manage the alarm notification topic
+              - Sid: SNS
+                Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                  - sns:SetTopicAttributes
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:ListSubscriptionsByTopic
+                  - sns:TagResource
+                  - sns:UntagResource
+                Resource: !Sub 'arn:aws:sns:us-east-1:${AWS::AccountId}:${MainStackName}*'
+
+              # CloudWatch Logs - log group, retention policy, and metric filters
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:PutRetentionPolicy
+                  - logs:DeleteRetentionPolicy
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                  - logs:DescribeLogGroups
+                  - logs:DescribeMetricFilters
+                  - logs:TagLogGroup
+                  - logs:UntagLogGroup
+                  - logs:ListTagsLogGroup
+                Resource: !Sub 'arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/${MainStackName}*'
+
+              # CloudWatch - alarms and dashboard
+              - Sid: CloudWatchAlarmsAndDashboards
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListDashboards
+                  - cloudwatch:TagResource
+                  - cloudwatch:UntagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: '*'
+
+              # IAM - create and manage the Lambda execution role
+              # Required because sam deploy uses CAPABILITY_NAMED_IAM
+              - Sid: IAMRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${MainStackName}*'
+
+              # IAM - pass the Lambda execution role to the Lambda service
+              - Sid: IAMPassRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${MainStackName}*'
+
+Outputs:
+  RoleArn:
+    Description: >
+      Paste this ARN into your GitHub repo secrets as AWS_ROLE_ARN
+    Value: !GetAtt GitHubActionsRole.Arn

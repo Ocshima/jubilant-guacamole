@@ -1,0 +1,13 @@
+trade_id,timestamp,symbol,side,quantity,price,trader_id,venue
+# --- WRONG COLUMN COUNT: too few columns ---
+550e8400-e29b-41d4-a716-446655443001,2024-03-15T10:31:00Z,AAPL,BUY,100
+# --- WRONG COLUMN COUNT: too many columns (extra field) ---
+550e8400-e29b-41d4-a716-446655443002,2024-03-15T10:32:00Z,MSFT,SELL,200,415.20,TDR002,NYSE,EXTRA_FIELD
+# --- MIXED: one valid row between two invalid rows ---
+550e8400-e29b-41d4-a716-446655443003,2024-03-15T10:33:00Z,GOOGL,BUY,300,141.75,TDR003,NASDAQ
+,2024-03-15T10:34:00Z,,SELL,400,178.90,TDR001,NYSE
+550e8400-e29b-41d4-a716-446655443004,2024-03-15T10:35:00Z,AMZN,BUY,500,178.90,TDR004,NYSE
+# --- ALL SPACES: fields present but whitespace only ---
+   ,   ,   ,   ,   ,   ,   ,
+# --- DUPLICATE trade_id (same as a valid record): should be silently skipped ---
+550e8400-e29b-41d4-a716-446655440001,2024-03-15T09:31:00Z,AAPL,BUY,500,172.45,TDR001,NASDAQ

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(aws sqs:*)",
+      "Bash(python3 -c \":*)",
+      "Bash(aws s3:*)"
+    ]
+  }
+}

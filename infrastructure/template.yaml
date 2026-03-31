@@ -1,0 +1,582 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Project 2 - Serverless ETL Pipeline with Observability
+  S3 (raw CSV uploads) -> Lambda (validate + transform) -> DynamoDB
+  Failures: SQS Dead-Letter Queue
+  Observability: Structured JSON logs, CloudWatch Metric Filters,
+                 CloudWatch Alarms, X-Ray tracing, CloudWatch Dashboard
+
+Parameters:
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+
+  AlertEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm SNS notifications.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [7, 14, 30, 60, 90]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    Timeout: 60
+    MemorySize: 256
+    Tracing: Active           # X-Ray active tracing on all functions
+    Environment:
+      Variables:
+        ENVIRONMENT:              !Ref Environment
+        POWERTOOLS_SERVICE_NAME:  trade-processor
+        LOG_LEVEL:                INFO
+
+Resources:
+
+  # ── 1. RAW UPLOADS BUCKET ────────────────────────────────────────
+  # Receives CSV files uploaded by users or upstream systems.
+  # Versioning enabled so uploads are preserved even after processing.
+  # Lifecycle rule removes objects after 30 days to control costs.
+  RawUploadsBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >
+              Access logging for this bucket would require a separate logging
+              bucket. For a portfolio ETL pipeline, CloudTrail data events
+              provide equivalent audit coverage at lower cost.
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-${AWS::StackName}-raw-uploads'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRawUploads
+            Status: Enabled
+            ExpirationInDays: 30
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: trade-etl-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+
+  RawUploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref RawUploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt RawUploadsBucket.Arn
+              - !Sub '${RawUploadsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # ── 2. SQS DEAD-LETTER QUEUE ─────────────────────────────────────
+  # Receives two categories of failures:
+  #   a) Per-record validation failures (sent explicitly by Lambda code)
+  #   b) Lambda invocation failures after retry exhaustion (Lambda DLQ config)
+  # Messages are retained for 14 days — long enough for investigation
+  # and replay without incurring excessive SQS storage costs.
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600   # 14 days in seconds
+      VisibilityTimeout: 300            # 5 min — matches Lambda timeout
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: trade-etl-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 3. DYNAMODB — TRADES TABLE ───────────────────────────────────
+  # Stores processed, validated trade records.
+  # TTL attribute: items auto-expire 90 days after processing.
+  # GSI on trade_date allows efficient queries like "all trades on date X".
+  TradesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain        # Preserve data on stack teardown
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${AWS::StackName}-trades'
+      BillingMode: PAY_PER_REQUEST  # On-demand — no capacity planning needed
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: trade_id
+          AttributeType: S
+        - AttributeName: trade_date
+          AttributeType: S
+        - AttributeName: symbol
+          AttributeType: S
+      KeySchema:
+        - AttributeName: trade_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: trade_date-symbol-index
+          KeySchema:
+            - AttributeName: trade_date
+              KeyType: HASH
+            - AttributeName: symbol
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: trade-etl-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 4. DYNAMODB — IDEMPOTENCY TABLE ──────────────────────────────
+  # Tracks which S3 objects have been processed.
+  # Key: "{bucket}/{key}#{etag}" — unique per object version.
+  # TTL: 7 days (much shorter than trade data retention).
+  IdempotencyTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-idempotency'
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: idempotency_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: idempotency_key
+          KeyType: HASH
+      Tags:
+        - Key: Project
+          Value: trade-etl-pipeline
+
+  # ── 5. LAMBDA EXECUTION ROLE ─────────────────────────────────────
+  # Least-privilege role — scoped to specific resource ARNs where possible.
+  TradeProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-processor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: TradeProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3ReadRaw
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                # Constructed ARN avoids a circular dependency:
+                # RawUploadsBucket -> TradeProcessorFunction -> TradeProcessorRole -> RawUploadsBucket
+                Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-${AWS::StackName}-raw-uploads/*'
+
+              - Sid: DynamoDBTrades
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt TradesTable.Arn
+                  - !Sub '${TradesTable.Arn}/index/*'
+
+              - Sid: DynamoDBIdempotency
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt IdempotencyTable.Arn
+
+              - Sid: SQSSendDLQ
+                Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  # ── 6. LAMBDA FUNCTION ───────────────────────────────────────────
+  TradeProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-processor'
+      CodeUri: ../src/processor/
+      Handler: handler.handler
+      Role: !GetAtt TradeProcessorRole.Arn
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Events:
+        S3Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref RawUploadsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME:      !Ref TradesTable
+          IDEMPOTENCY_TABLE_NAME:   !Ref IdempotencyTable
+          DLQ_URL:                  !Ref DeadLetterQueue
+      Tags:
+        Project: trade-etl-pipeline
+        Environment: !Ref Environment
+
+  TradeProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TradeProcessorFunction}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ── 7. SNS TOPIC FOR ALARMS ──────────────────────────────────────
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── 8. CLOUDWATCH METRIC FILTERS ─────────────────────────────────
+  # Parse structured JSON log fields to produce custom metrics.
+  # No PutMetricData calls inside the Lambda — metrics come from logs.
+  # Namespace: TradeETL/{environment}
+
+  # Count of successfully processed records
+  MetricFilterRecordsValid:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TradeProcessorLogGroup
+      FilterPattern: '{ $.event = "record_processed" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'TradeETL/${Environment}'
+          MetricName: RecordsValid
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # Count of invalid records sent to DLQ
+  MetricFilterRecordsInvalid:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TradeProcessorLogGroup
+      FilterPattern: '{ $.event = "record_sent_to_dlq" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'TradeETL/${Environment}'
+          MetricName: RecordsInvalid
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # File processing duration (milliseconds) — from summary log
+  MetricFilterProcessingDuration:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TradeProcessorLogGroup
+      FilterPattern: '{ $.event = "file_processing_complete" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'TradeETL/${Environment}'
+          MetricName: ProcessingDurationMs
+          MetricValue: '$.duration_ms'
+          DefaultValue: 0
+
+  # DynamoDB write failures
+  MetricFilterDBErrors:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TradeProcessorLogGroup
+      FilterPattern: '{ $.event = "dynamodb_write_failed" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'TradeETL/${Environment}'
+          MetricName: DynamoDBErrors
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # Duplicate files skipped (idempotency working correctly)
+  MetricFilterDuplicatesSkipped:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref TradeProcessorLogGroup
+      FilterPattern: '{ $.event = "object_already_processed" }'
+      MetricTransformations:
+        - MetricNamespace: !Sub 'TradeETL/${Environment}'
+          MetricName: DuplicatesSkipped
+          MetricValue: '1'
+          DefaultValue: 0
+
+  # ── 9. CLOUDWATCH ALARMS ─────────────────────────────────────────
+
+  # DLQ depth > 0 means at least one record failed — highest priority alarm
+  AlarmDLQDepth:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-depth'
+      AlarmDescription: >
+        DLQ has messages. At least one trade record failed validation or
+        processing. Investigate DLQ messages to identify the root cause.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      OKActions:    [!Ref AlarmTopic]
+
+  # Lambda error rate > 5% over 5 minutes
+  AlarmLambdaErrors:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: Lambda error rate exceeds 5% — invocation failures.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TradeProcessorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # Lambda P95 duration > 45s (75% of 60s timeout — early warning)
+  AlarmLambdaDuration:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-duration'
+      AlarmDescription: >
+        Lambda P95 duration exceeds 45 seconds. Risk of timeout on large files.
+        Consider increasing MemorySize or splitting large uploads.
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TradeProcessorFunction
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 45000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # High invalid record rate (> 20 invalid in 5 min window) — data quality alert
+  AlarmHighInvalidRate:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-invalid-rate'
+      AlarmDescription: >
+        More than 20 invalid records in 5 minutes. Possible upstream data
+        quality issue or schema change in source system.
+      Namespace: !Sub 'TradeETL/${Environment}'
+      MetricName: RecordsInvalid
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # ── 10. CLOUDWATCH DASHBOARD ─────────────────────────────────────
+  # Single-pane-of-glass view for the pipeline. Visible at:
+  # CloudWatch -> Dashboards -> trade-etl-pipeline-{env}
+  TradeETLDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-${Environment}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": {
+                "markdown": "# Trade ETL Pipeline — ${Environment}\nStack: `${AWS::StackName}` | Region: `${AWS::Region}` | [DLQ](https://console.aws.amazon.com/sqs/v3/home?region=${AWS::Region}#/queues/${DeadLetterQueue})"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 2, "width": 6, "height": 6,
+              "properties": {
+                "title": "Records Processed (Valid)",
+                "region": "${AWS::Region}",
+                "metrics": [["TradeETL/${Environment}", "RecordsValid"]],
+                "stat": "Sum", "period": 300, "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 6, "y": 2, "width": 6, "height": 6,
+              "properties": {
+                "title": "Records Invalid (DLQ)",
+                "region": "${AWS::Region}",
+                "metrics": [["TradeETL/${Environment}", "RecordsInvalid"]],
+                "stat": "Sum", "period": 300, "view": "singleValue",
+                "annotations": { "horizontal": [{ "value": 1, "color": "#d62728" }] }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 2, "width": 6, "height": 6,
+              "properties": {
+                "title": "DLQ Depth",
+                "region": "${AWS::Region}",
+                "metrics": [["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${DeadLetterQueue.QueueName}"]],
+                "stat": "Maximum", "period": 60, "view": "singleValue",
+                "annotations": { "horizontal": [{ "value": 1, "color": "#d62728" }] }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 18, "y": 2, "width": 6, "height": 6,
+              "properties": {
+                "title": "Duplicates Skipped",
+                "region": "${AWS::Region}",
+                "metrics": [["TradeETL/${Environment}", "DuplicatesSkipped"]],
+                "stat": "Sum", "period": 300, "view": "singleValue"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Valid vs Invalid Records (5-min)",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["TradeETL/${Environment}", "RecordsValid",   {"label": "Valid",   "color": "#2ca02c"}],
+                  ["TradeETL/${Environment}", "RecordsInvalid", {"label": "Invalid", "color": "#d62728"}]
+                ],
+                "stat": "Sum", "period": 300, "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 8, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Duration (ms)",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${TradeProcessorFunction}", {"stat": "p50",  "label": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${TradeProcessorFunction}", {"stat": "p95",  "label": "p95"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${TradeProcessorFunction}", {"stat": "p99",  "label": "p99"}]
+                ],
+                "period": 300, "view": "timeSeries",
+                "annotations": { "horizontal": [{"value": 45000, "label": "Alert threshold", "color": "#ff7f0e"}] }
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Invocations & Errors",
+                "region": "${AWS::Region}",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${TradeProcessorFunction}", {"label": "Invocations", "color": "#1f77b4"}],
+                  ["AWS/Lambda", "Errors",      "FunctionName", "${TradeProcessorFunction}", {"label": "Errors",      "color": "#d62728"}]
+                ],
+                "stat": "Sum", "period": 300, "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 14, "width": 12, "height": 6,
+              "properties": {
+                "title": "File Processing Duration (ms)",
+                "region": "${AWS::Region}",
+                "metrics": [["TradeETL/${Environment}", "ProcessingDurationMs", {"stat": "p95", "label": "p95 per file"}]],
+                "period": 300, "view": "timeSeries"
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 20, "width": 24, "height": 4,
+              "properties": {
+                "title": "Alarm Status",
+                "region": "${AWS::Region}",
+                "alarms": [
+                  "${AlarmDLQDepth.Arn}",
+                  "${AlarmLambdaErrors.Arn}",
+                  "${AlarmLambdaDuration.Arn}",
+                  "${AlarmHighInvalidRate.Arn}"
+                ]
+              }
+            }
+          ]
+        }
+
+Outputs:
+
+  RawUploadsBucketName:
+    Description: Upload CSV files here to trigger the pipeline
+    Value: !Ref RawUploadsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-uploads-bucket'
+
+  TradesTableName:
+    Description: DynamoDB table containing processed trade records
+    Value: !Ref TradesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-trades-table'
+
+  DLQUrl:
+    Description: SQS Dead-Letter Queue URL — inspect failed records here
+    Value: !Ref DeadLetterQueue
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${TradeETLDashboard}'
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref TradeProcessorFunction
