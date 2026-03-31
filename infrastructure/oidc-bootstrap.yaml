@@ -218,6 +218,9 @@ Resources:
                   - logs:TagLogGroup
                   - logs:UntagLogGroup
                   - logs:ListTagsLogGroup
+                  - logs:TagResource
+                  - logs:UntagResource
+                  - logs:ListTagsForResource
                 Resource: !Sub 'arn:aws:logs:us-east-1:${AWS::AccountId}:log-group:/aws/lambda/${MainStackName}*'
 
               # CloudWatch - alarms and dashboard
