@@ -187,10 +187,10 @@ Edit `events/s3_put_event.json` to point at your real bucket and the key you jus
       ...
       "s3": {
         "bucket": {
-          "name": "184425327779-trade-etl-pipeline-raw-uploads"
+          "name": "123456789012-trade-etl-pipeline-raw-uploads"
         },
         "object": {
-          "key": "uploads/trades_valid_20260331_054809.csv",
+          "key": "uploads/trades_valid_20240315_093100.csv",
           "eTag": "any-string-here"
         }
       }
@@ -208,7 +208,7 @@ Paste the real values from `make outputs`:
   "TradeProcessorFunction": {
     "DYNAMODB_TABLE_NAME":    "trade-etl-pipeline-trades",
     "IDEMPOTENCY_TABLE_NAME": "trade-etl-pipeline-idempotency",
-    "DLQ_URL":                "https://sqs.us-east-1.amazonaws.com/184425327779/trade-etl-pipeline-dlq",
+    "DLQ_URL":                "https://sqs.us-east-1.amazonaws.com/123456789012/trade-etl-pipeline-dlq",
     "ENVIRONMENT":            "dev"
   }
 }

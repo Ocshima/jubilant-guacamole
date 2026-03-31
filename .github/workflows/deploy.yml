@@ -78,8 +78,7 @@ jobs:
       - name: SAM build
         run: |
           sam build \
-            --template infrastructure/template.yaml \
-            --use-container
+            --template infrastructure/template.yaml
 
       - name: SAM deploy
         run: |
